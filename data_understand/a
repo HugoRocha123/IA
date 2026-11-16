@@ -1,0 +1,356 @@
+# Instalar dependências, se necessário:
+# pip install pandas numpy scikit-learn joblib matplotlib
+
+from pathlib import Path
+import json
+import warnings
+
+import joblib
+import numpy as np
+import pandas as pd
+
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    average_precision_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import (
+    RandomizedSearchCV,
+    StratifiedKFold,
+    cross_val_predict,
+    cross_validate,
+    train_test_split,
+)
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.tree import DecisionTreeClassifier
+
+warnings.filterwarnings("ignore")
+
+# ---------- Configuração ----------
+CSV_PATH = "train.csv"       # Altera para o caminho do CSV
+TARGET = "Response"          # Alvo esperado neste dataset
+ID_COLUMNS = ["id"]          # Identificadores a excluir, se existirem
+TEST_SIZE = 0.20
+SEED = 42
+CV_FOLDS = 5
+N_ITER_TUNING = 12
+BETA = 0.7                   # beta < 1 dá mais peso à precision
+OUTPUT_DIR = Path("models")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ---------- Geração Automática de Dados (Se em falta) ----------
+if not Path(CSV_PATH).exists():
+    print(f"[AVISO] '{CSV_PATH}' não encontrado. Criando um dataset sintético para demonstração...")
+    np.random.seed(SEED)
+    n_samples = 1000
+    synthetic_df = pd.DataFrame({
+        "id": np.arange(1, n_samples + 1),
+        "Age": np.random.randint(18, 70, size=n_samples),
+        "Annual_Income": np.random.normal(50000, 15000, size=n_samples),
+        "Credit_Score": np.random.randint(300, 850, size=n_samples),
+        "Gender": np.random.choice(["Male", "Female"], size=n_samples),
+        "Vehicle_Damage": np.random.choice(["Yes", "No"], size=n_samples),
+        "Response": np.random.choice([0, 1], p=[0.85, 0.15], size=n_samples)
+    })
+    synthetic_df.to_csv(CSV_PATH, index=False)
+    print(f"Dataset sintético salvo como '{CSV_PATH}' com sucesso.\n")
+
+
+# ---------- Carregamento e validação ----------
+df = pd.read_csv(CSV_PATH)
+
+if TARGET not in df.columns:
+    raise ValueError(
+        f"Não encontrei a coluna alvo {TARGET!r}. "
+        f"Colunas disponíveis: {df.columns.tolist()}"
+    )
+
+# Remover linhas sem valor de alvo
+df = df.dropna(subset=[TARGET]).copy()
+
+# Converter o alvo para 0/1, se necessário
+y = df[TARGET]
+if set(pd.Series(y).dropna().unique()).issubset({0, 1, False, True}):
+    y = y.astype(int)
+else:
+    raise ValueError(
+        f"A coluna {TARGET!r} deve estar codificada como 0/1. "
+        f"Valores encontrados: {sorted(pd.Series(y).dropna().unique())}"
+    )
+
+# Excluir alvo e identificadores
+drop_columns = [TARGET] + [c for c in ID_COLUMNS if c in df.columns]
+X = df.drop(columns=drop_columns)
+
+if X.shape[1] == 0:
+    raise ValueError("Não há atributos disponíveis para treinar o modelo.")
+
+print("Dimensão dos dados:", df.shape)
+print("Número de atributos:", X.shape[1])
+print("Prevalência da classe positiva:", round(float(y.mean()), 4))
+
+
+# ---------- Pré-processamento ----------
+# As categorias e valores em falta são tratados dentro do pipeline,
+# evitando ajustar o pré-processamento com os dados de validação/teste.
+categorical_columns = X.select_dtypes(
+    include=["object", "category", "bool"]
+).columns.tolist()
+
+numeric_columns = [
+    column for column in X.columns if column not in categorical_columns
+]
+
+numeric_pipeline = Pipeline(
+    steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+    ]
+)
+
+categorical_pipeline = Pipeline(
+    steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+    ]
+)
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("numeric", numeric_pipeline, numeric_columns),
+        ("categorical", categorical_pipeline, categorical_columns),
+    ],
+    remainder="drop",
+)
+
+
+# ---------- Separação treino/teste ----------
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    y,
+    test_size=TEST_SIZE,
+    random_state=SEED,
+    stratify=y,
+)
+
+cv = StratifiedKFold(
+    n_splits=CV_FOLDS,
+    shuffle=True,
+    random_state=SEED,
+)
+
+
+# ---------- Modelos candidatos ----------
+candidates = {
+    "LogisticRegression": LogisticRegression(
+        max_iter=2000,
+        class_weight="balanced",
+        random_state=SEED,
+    ),
+    "DecisionTree": DecisionTreeClassifier(
+        max_depth=8,
+        min_samples_leaf=20,
+        class_weight="balanced",
+        random_state=SEED,
+    ),
+    "RandomForest": RandomForestClassifier(
+        n_estimators=250,
+        max_features="sqrt",
+        class_weight="balanced_subsample",
+        n_jobs=-1,
+        random_state=SEED,
+    ),
+    "HistGradientBoosting": HistGradientBoostingClassifier(
+        max_iter=150,
+        learning_rate=0.08,
+        max_leaf_nodes=31,
+        random_state=SEED,
+    ),
+}
+
+# ---------- Comparação por validação cruzada ----------
+results = []
+
+for name, classifier in candidates.items():
+    model = Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            ("classifier", classifier),
+        ]
+    )
+
+    scores = cross_validate(
+        model,
+        X_train,
+        y_train,
+        cv=cv,
+        scoring={
+            "roc_auc": "roc_auc",
+            "pr_auc": "average_precision",
+        },
+        n_jobs=-1,
+        return_train_score=False,
+    )
+
+    results.append(
+        {
+            "model": name,
+            "roc_auc_mean": scores["test_roc_auc"].mean(),
+            "roc_auc_std": scores["test_roc_auc"].std(),
+            "pr_auc_mean": scores["test_pr_auc"].mean(),
+            "pr_auc_std": scores["test_pr_auc"].std(),
+        }
+    )
+
+results_df = pd.DataFrame(results).sort_values(
+    "pr_auc_mean", ascending=False
+)
+print("\nComparação de modelos (ordenada por PR-AUC):")
+print(results_df.to_string(index=False))
+results_df.to_csv(OUTPUT_DIR / "model_comparison.csv", index=False)
+
+
+# ---------- Afinação do melhor candidato ----------
+best_name = results_df.iloc[0]["model"]
+print(f"\nModelo selecionado para afinação: {best_name}")
+
+# Cada espaço de pesquisa contém parâmetros do classificador.
+search_spaces = {
+    "LogisticRegression": {
+        "classifier__C": [0.01, 0.1, 1.0, 10.0],
+    },
+    "DecisionTree": {
+        "classifier__max_depth": [4, 6, 8, 12, None],
+        "classifier__min_samples_leaf": [5, 10, 20, 50],
+    },
+    "RandomForest": {
+        "classifier__n_estimators": [150, 250, 400],
+        "classifier__max_depth": [None, 8, 15, 25],
+        "classifier__min_samples_leaf": [2, 5, 10],
+        "classifier__max_features": ["sqrt", 0.5],
+    },
+    "HistGradientBoosting": {
+        "classifier__learning_rate": [0.03, 0.06, 0.1],
+        "classifier__max_iter": [100, 150, 250],
+        "classifier__max_leaf_nodes": [15, 31, 63],
+        "classifier__l2_regularization": [0.0, 1.0, 5.0],
+    },
+}
+
+best_pipeline = Pipeline(
+    steps=[
+        ("preprocessor", preprocessor),
+        ("classifier", candidates[best_name]),
+    ]
+)
+
+search = RandomizedSearchCV(
+    estimator=best_pipeline,
+    param_distributions=search_spaces[best_name],
+    n_iter=N_ITER_TUNING,
+    scoring="average_precision",
+    cv=cv,
+    random_state=SEED,
+    n_jobs=-1,
+    refit=True,
+)
+
+search.fit(X_train, y_train)
+tuned_model = search.best_estimator_
+
+print("Melhor PR-AUC na validação cruzada:", round(search.best_score_, 4))
+print("Melhores parâmetros:", search.best_params_)
+
+
+# ---------- Escolha do limiar com previsões out-of-fold ----------
+oof_probabilities = cross_val_predict(
+    tuned_model,
+    X_train,
+    y_train,
+    cv=cv,
+    method="predict_proba",
+    n_jobs=-1,
+)[:, 1]
+
+
+def f_beta_score(precision, recall, beta=0.7):
+    beta_squared = beta ** 2
+    denominator = beta_squared * precision + recall
+    if denominator == 0:
+        return 0.0
+    return (1 + beta_squared) * precision * recall / denominator
+
+
+thresholds = np.linspace(0.01, 0.99, 99)
+threshold_results = []
+
+for threshold in thresholds:
+    predictions = (oof_probabilities >= threshold).astype(int)
+    p = precision_score(y_train, predictions, zero_division=0)
+    r = recall_score(y_train, predictions, zero_division=0)
+
+    threshold_results.append(
+        (threshold, f_beta_score(p, r, beta=BETA), p, r)
+    )
+
+best_threshold, best_fbeta, _, _ = max(
+    threshold_results, key=lambda row: row[1]
+)
+
+print(f"\nLimiar escolhido: {best_threshold:.2f}")
+print(f"F-beta no treino (out-of-fold): {best_fbeta:.4f}")
+
+
+# ---------- Treino final e avaliação única no teste ----------
+tuned_model.fit(X_train, y_train)
+
+test_probabilities = tuned_model.predict_proba(X_test)[:, 1]
+test_predictions = (test_probabilities >= best_threshold).astype(int)
+
+metrics = {
+    "roc_auc": float(roc_auc_score(y_test, test_probabilities)),
+    "pr_auc": float(average_precision_score(y_test, test_probabilities)),
+    "precision": float(
+        precision_score(y_test, test_predictions, zero_division=0)
+    ),
+    "recall": float(
+        recall_score(y_test, test_predictions, zero_division=0)
+    ),
+    "f1": float(f1_score(y_test, test_predictions, zero_division=0)),
+    "threshold": float(best_threshold),
+    "positive_rate_test": float(y_test.mean()),
+}
+
+print("\nMétricas finais no teste:")
+for name, value in metrics.items():
+    print(f"{name}: {value:.4f}")
+
+print("\nMatriz de confusão:")
+print(confusion_matrix(y_test, test_predictions))
+
+with open(OUTPUT_DIR / "test_metrics.json", "w", encoding="utf-8") as file:
+    json.dump(metrics, file, indent=2)
+
+
+# Guardar o modelo e informação necessária para o reutilizar
+artifact = {
+    "model": tuned_model,
+    "threshold": float(best_threshold),
+    "target": TARGET,
+    "feature_columns": X.columns.tolist(),
+    "best_model_name": best_name,
+    "best_params": search.best_params_,
+}
+
+joblib.dump(artifact, OUTPUT_DIR / "best_model.joblib")
+
+print(f"\nModelo e métricas guardados em: {OUTPUT_DIR.resolve()}")
