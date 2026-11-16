@@ -1,0 +1,25 @@
+{
+  "dataset": "zarajamshaid/language-identification-datasst",
+  "format": "CSV (UTF-8), uma linha por amostra",
+  "columns": {
+    "Text": {
+      "type": "string",
+      "unit": "n/a (texto livre)",
+      "nullable": false,
+      "role": "feature"
+    },
+    "language": {
+      "type": "string (categoria)",
+      "unit": "n/a",
+      "nullable": false,
+      "role": "target",
+      "n_classes": 22
+    }
+  },
+  "sampling_frequency": "n/a (não é série temporal)",
+  "temporal_component": false,
+  "constraints": {
+    "min_text_chars": 1,
+    "max_missing_ratio": 0.01
+  }
+}
