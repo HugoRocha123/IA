@@ -1,4 +1,4 @@
-# Language Identification — IA III / ML III
+# Language Identification — IA III
 
 Executar **na raiz desta pasta**, por ordem:
 
